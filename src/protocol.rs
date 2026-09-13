@@ -6,7 +6,7 @@ use crate::file_scanner::FileInfo;
 pub enum SyncMessage {
     // Sent by client.
     FileInfo(FileInfo),
-    FileContent{ path: String, content: Vec<u8> },
+    FileContentStream { path: String }, // chunked LZ4 byte stream follows on the wire
     DeleteFile{path: String},
     CreateDir{path: String},
     RemoveDir{path: String},

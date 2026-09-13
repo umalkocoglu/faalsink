@@ -10,6 +10,5 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
 walkdir = "2.5.0"
 anyhow = "1.0.104"
+lz4_flex = "0.14.0"
 
-
-# test degisikligi

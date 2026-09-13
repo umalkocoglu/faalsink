@@ -4,5 +4,7 @@ mod protocol;
 
 #[tokio::main]
 async fn main() {
-    network::run_server().await;
-}   
+    if let Err(e) = network::run_server().await {
+        eprintln!("Server exited with error: {}", e);
+    }
+}

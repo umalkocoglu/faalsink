@@ -1,5 +1,5 @@
 use tokio::net::TcpStream;
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncBufReadExt, BufReader};
 use std::collections::HashMap;
 use anyhow::{Context, Result};
 
@@ -14,7 +14,7 @@ use file_scanner::{scan_directory, normalize_path};
 
 #[tokio::main]
 async fn main() -> Result<()>{
-    let mut stream = TcpStream::connect("127.0.0.1:8080")
+    let stream = TcpStream::connect("127.0.0.1:8080")
         .await
         .context("Could not connect to server, make sure the server is running.")?;
     let (read_half, mut write_half) = stream.into_split();
@@ -68,10 +68,10 @@ async fn main() -> Result<()>{
             continue;
         }
 
-        let content = match std::fs::read(&file.path) {
-            Ok(content) => content,
+        let mut f = match tokio::fs::File::open(&file.path).await {
+            Ok(f) => f,
             Err(e) => {
-                eprintln!("Warning: {} could not be read, skipping... Error: {}", path_str, e);
+                eprintln!("Warning: {} could not be opened, skipping... Error: {}", path_str, e);
                 continue;
             }
         };
@@ -81,16 +81,28 @@ async fn main() -> Result<()>{
         write_half.write_all(json.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
 
-        let content_message = SyncMessage::FileContent {
-            path: path_str.clone(),
-            content,
-        };
-
-        let json = serde_json::to_string(&content_message)?;
+        let stream_msg = SyncMessage::FileContentStream { path: path_str.clone() };
+        let json = serde_json::to_string(&stream_msg)?;
         write_half.write_all(json.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
 
-        println!("Sent(changed/new): {}", path_str);   
+        // Read the file in 64 KB chunks, LZ4-compress each one, and stream it:
+        // [4-byte compressed length][compressed bytes], terminated by a 0 length.
+        let mut buffer = [0u8; 65536];
+
+        loop {
+            let n = f.read(&mut buffer).await?;
+            if n == 0 {
+                write_half.write_u32(0).await?; // EOF signal
+                break;
+            }
+
+            let compressed = lz4_flex::compress_prepend_size(&buffer[..n]);
+            write_half.write_u32(compressed.len() as u32).await?;
+            write_half.write_all(&compressed).await?;
+        }
+
+        println!("Sent: {}", path_str);
     }
 
     for (deleted_path, value) in server_manifest {
@@ -104,7 +116,12 @@ async fn main() -> Result<()>{
         write_half.write_all(b"\n").await?;
         println!("Sent(delete/remove): {}", deleted_path);
     }
-    
+
+    let complete_message = SyncMessage::SyncComplete;
+    let json = serde_json::to_string(&complete_message)?;
+    write_half.write_all(json.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
     println!("Sent: SyncComplete");
+
     Ok(())
 }

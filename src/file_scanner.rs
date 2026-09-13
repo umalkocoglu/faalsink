@@ -1,8 +1,8 @@
 use std::path::PathBuf;
-use std::fs;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use walkdir::WalkDir;
 use std::collections::HashMap;
-
 
 use serde::{Serialize, Deserialize};
 
@@ -14,7 +14,7 @@ pub struct FileInfo {
     pub hash: Option<String>,
 }
 
-pub fn scan_directory (root: &str) -> Vec<FileInfo> {
+pub fn scan_directory(root: &str) -> Vec<FileInfo> {
     let mut files: Vec<FileInfo> = Vec::new();
     let skip_received_files = root != "received_files";
 
@@ -26,13 +26,13 @@ pub fn scan_directory (root: &str) -> Vec<FileInfo> {
                 continue;
             }
         };
-        
+
         let path = entry.path();
 
         let should_skip = path.components().any(|comp| {
-            comp.as_os_str() == "target" 
-            || comp.as_os_str() == ".git"
-            || (skip_received_files && comp.as_os_str() == "received_files")
+            comp.as_os_str() == "target"
+                || comp.as_os_str() == ".git"
+                || (skip_received_files && comp.as_os_str() == "received_files")
         });
 
         if should_skip {
@@ -48,52 +48,60 @@ pub fn scan_directory (root: &str) -> Vec<FileInfo> {
         };
 
         let is_dir = metadata.is_dir();
-        
+
         if is_dir {
-            let file_info = FileInfo {
+            files.push(FileInfo {
                 path: path.to_path_buf(),
                 size: metadata.len(),
                 is_dir,
                 hash: None,
-            };
-            files.push(file_info);
+            });
             continue;
         }
-        
 
-        let content = match fs::read(&path) {
-            Ok(c) => c,
+        let hash = match hash_file(path) {
+            Ok(h) => h,
             Err(err) => {
                 eprintln!("Error reading file {}: {}", path.display(), err);
                 continue;
             }
         };
 
-
-        let hash = blake3::hash(&content);
-        
-        let file_info = FileInfo {
+        files.push(FileInfo {
             path: path.to_path_buf(),
             size: metadata.len(),
             is_dir,
-            hash: Some(hash.to_string()),
-        };
-
-        files.push(file_info);
+            hash: Some(hash),
+        });
     }
 
     files
+}
 
+fn hash_file(path: &std::path::Path) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 65536];
+
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
+    Ok(hasher.finalize().to_string())
 }
 
 pub fn build_manifest(root: &str) -> HashMap<String, Option<String>> {
     let files = scan_directory(root);
-    let mut manifest : HashMap<String, Option<String>> = HashMap::new();
+    let mut manifest: HashMap<String, Option<String>> = HashMap::new();
 
     for file in files {
         let path_str = normalize_path(&file.path, root);
         manifest.insert(path_str, file.hash);
-
     }
     manifest
 }
