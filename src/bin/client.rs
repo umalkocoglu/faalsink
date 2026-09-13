@@ -21,7 +21,7 @@ async fn main() {
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
 
-    let server_manifest: HashMap<String, String> = match serde_json::from_str::<SyncMessage>(line.trim()) {
+    let mut server_manifest: HashMap<String, Option<String>> = match serde_json::from_str::<SyncMessage>(line.trim()) {
         Ok(SyncMessage::Manifest(manifest)) => manifest,
         _ => {
             eprintln!("Expected Manifest message, got something else.");
@@ -35,18 +35,28 @@ async fn main() {
 
 
     for file in &files {
-        
+        let path_str = normalize_path(&file.path, ".");
+
         if file.is_dir {
+            if server_manifest.contains_key(&path_str) {
+                server_manifest.remove(&path_str);
+            } else {
+                let message = SyncMessage::CreateDir { path: path_str.clone() };
+                let json = serde_json::to_string(&message).unwrap();
+                write_half.write_all(json.as_bytes()).await.unwrap();
+                write_half.write_all(b"\n").await.unwrap();
+                println!("Sent (created directory): {}", path_str);
+            }
+
             continue;
         }
 
-        let path_str = normalize_path(&file.path, ".");
-
         let needs_sync = match server_manifest.get(&path_str) {
-            Some(server_hash) => Some(server_hash) != file.hash.as_ref(),
+            Some(server_hash) => server_hash != &file.hash,
             None => true,
         };
 
+        server_manifest.remove(&path_str);
 
         if !needs_sync {
             println!("File {} is up to date, skipping.", path_str);
@@ -70,6 +80,25 @@ async fn main() {
         write_half.write_all(b"\n").await.unwrap();
 
         println!("Sent(changed/new): {}", path_str);   
+    }
+
+    for (deleted_path, value) in server_manifest {
+        match value {
+            Some(_) => {
+                let delete_message = SyncMessage::DeleteFile {path: deleted_path.clone()};
+                let json = serde_json::to_string(&delete_message).unwrap();
+                write_half.write_all(json.as_bytes()).await.unwrap();
+                write_half.write_all(b"\n").await.unwrap();
+                println!("Sent(deleted file): {}", deleted_path);
+            }
+            None => {
+                let remove_message = SyncMessage::RemoveDir {path: deleted_path.clone()};
+                let json = serde_json::to_string(&remove_message).unwrap();
+                write_half.write_all(json.as_bytes()).await.unwrap();
+                write_half.write_all(b"\n").await.unwrap();
+                println!("Sent(removed directory): {}", deleted_path);
+            }
+        }
     }
 
     let complete_message = SyncMessage::SyncComplete;
