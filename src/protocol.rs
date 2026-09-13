@@ -4,8 +4,13 @@ use crate::file_scanner::FileInfo;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SyncMessage {
+    // Sent by client.
     FileInfo(FileInfo),
     FileContent{ path: String, content: Vec<u8> },
+    DeleteFile{path: String},
+    CreateDir{path: String},
+    RemoveDir{path: String},
     SyncComplete,
-    Manifest(HashMap<String, String>),
+    // Sent by server.
+    Manifest(HashMap<String, Option<String>>), // Some(hash) for files and None for directories
 }
