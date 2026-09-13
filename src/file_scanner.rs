@@ -86,27 +86,22 @@ pub fn scan_directory (root: &str) -> Vec<FileInfo> {
 
 }
 
-pub fn build_manifest(root: &str) -> HashMap<String, String> {
+pub fn build_manifest(root: &str) -> HashMap<String, Option<String>> {
     let files = scan_directory(root);
-    let mut manifest : HashMap<String, String> = HashMap::new();
+    let mut manifest : HashMap<String, Option<String>> = HashMap::new();
 
     for file in files {
-        if file.is_dir {
-            continue;
-        }
+        let path_str = normalize_path(&file.path, root);
+        manifest.insert(path_str, file.hash);
 
-        if let Some(hash) = &file.hash {
-            let path_str = normalize_path(&file.path, root);
-            manifest.insert(path_str, hash.clone());
-        }
     }
-
     manifest
 }
 
 pub fn normalize_path(path: &PathBuf, root: &str) -> String {
-    match path.strip_prefix(root) {
-        Ok(stripped) => stripped.to_string_lossy().to_string(),
-        Err(_) => path.to_string_lossy().to_string(),
-    }
+    let path_str = match path.strip_prefix(root) {
+        Ok(stripped) => stripped.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().into_owned(),
+    };
+    path_str.replace("\\", "/")
 }
