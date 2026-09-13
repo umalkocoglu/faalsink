@@ -2,12 +2,31 @@ use tokio::net::TcpListener;
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
 use crate::protocol::SyncMessage;
 
-use std::path::Path;
+use std::path::{Path, PathBuf, Component};
 use crate::file_scanner::build_manifest;
+
+fn build_safe_path(base: &str, user_path: &str) -> Result<PathBuf, &'static str> {
+    let path = Path::new(user_path);
+
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("Safety breach: Invalid file path component.");
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Path::new(base).join(path))
+}
+
+
 
 pub async fn run_server() {
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
     println!("Server listening on: 127.0.0.1:8080");
+
+    std::fs::create_dir_all("received_files").unwrap_or_default();
 
     loop {
         let (socket, addr) = listener.accept().await.unwrap();
@@ -46,16 +65,52 @@ pub async fn run_server() {
                                 println!("Received SyncComplete from {}", addr );
                             }
                             SyncMessage::FileContent { path, content } => {
-                                println!("Received FileContent from {}: path: {}, content length: {}", addr, path, content.len());
-                            
-                                let safe_path = Path::new("received_files").join(&path);
-                                if let Some(parent) = safe_path.parent() {
-                                    std::fs::create_dir_all(parent).unwrap();
+                                match build_safe_path("received_files", &path) {
+                                    Ok(safe_path) => {
+                                        if let Some(parent) = safe_path.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        match std::fs::write(&safe_path, &content) {
+                                            Ok(_) => println!("Saved FileContent to: {}", safe_path.display()),
+                                            Err(e) => eprintln!("Error writing file: {}", e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Rejected (FileContent) {}: {}", addr, e),
+                                }
+                            }
+                            SyncMessage::DeleteFile {path} => {
+                                match build_safe_path("received_files", &path) {
+                                    Ok(safe_path) => {
+                                        match std::fs::remove_file(&safe_path) {
+                                            Ok(_) => println!("Deleted File: {}", safe_path.display()),
+                                            Err(e) => eprintln!("Could not delete file {}: {}", safe_path.display(), e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Rejected (DeleteFile) {}: {}", addr, e),
                                 }
 
-                                std::fs::write(&safe_path, &content).unwrap();
-                            
-                                println!("Saved file content to: {}", safe_path.display());
+                            }
+                            SyncMessage::CreateDir { path } => {
+                                match build_safe_path("received_files", &path) {
+                                    Ok(safe_path) => {
+                                        match std::fs::create_dir_all(&safe_path) {
+                                            Ok(_) => println!("Created directory: {}", safe_path.display()),
+                                            Err(e) => eprintln!("Could not create directory {}: {}", safe_path.display(), e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Rejected (CreateDir) {}: {}", addr, e)
+                                }
+                            }
+                            SyncMessage::RemoveDir { path } => {
+                                match build_safe_path("received_files", &path) {
+                                    Ok(safe_path) => {
+                                        match std::fs::remove_dir_all(&safe_path) {
+                                            Ok(_) => println!("Removed directory: {}", safe_path.display()),
+                                            Err(e) => eprintln!("Could not remove directory {}: {}", safe_path.display(), e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Rejected (RemoveDir) {}: {}", addr, e)
+                                }
                             }
                             SyncMessage::Manifest(_) => {
                                 println!("Unexpected Manifest message from {}. ", addr);
