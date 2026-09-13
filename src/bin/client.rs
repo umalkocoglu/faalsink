@@ -1,6 +1,7 @@
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
 use std::collections::HashMap;
+use anyhow::{Context, Result};
 
 #[path = "../protocol.rs"]
 mod protocol;
@@ -12,14 +13,18 @@ use file_scanner::{scan_directory, normalize_path};
 
 
 #[tokio::main]
-async fn main() {
-    let mut stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
+async fn main() -> Result<()>{
+    let mut stream = TcpStream::connect("127.0.0.1:8080")
+        .await
+        .context("Could not connect to server, make sure the server is running.")?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
 
     let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
+    reader.read_line(&mut line)
+        .await
+        .context("Could not read line from server")?;
 
     let mut server_manifest: HashMap<String, Option<String>> = match serde_json::from_str::<SyncMessage>(line.trim()) {
         Ok(SyncMessage::Manifest(manifest)) => manifest,
@@ -42,9 +47,9 @@ async fn main() {
                 server_manifest.remove(&path_str);
             } else {
                 let message = SyncMessage::CreateDir { path: path_str.clone() };
-                let json = serde_json::to_string(&message).unwrap();
-                write_half.write_all(json.as_bytes()).await.unwrap();
-                write_half.write_all(b"\n").await.unwrap();
+                let json = serde_json::to_string(&message)?;
+                write_half.write_all(json.as_bytes()).await?;
+                write_half.write_all(b"\n").await?;
                 println!("Sent (created directory): {}", path_str);
             }
 
@@ -63,48 +68,43 @@ async fn main() {
             continue;
         }
 
+        let content = match std::fs::read(&file.path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Warning: {} could not be read, skipping... Error: {}", path_str, e);
+                continue;
+            }
+        };
 
         let message = SyncMessage::FileInfo(file.clone());
-        let json = serde_json::to_string(&message).unwrap();
-        write_half.write_all(json.as_bytes()).await.unwrap();
-        write_half.write_all(b"\n").await.unwrap();
+        let json = serde_json::to_string(&message)?;
+        write_half.write_all(json.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
 
-        let content = std::fs::read(&file.path).unwrap();
-        let content_message = SyncMessage::FileContent { 
+        let content_message = SyncMessage::FileContent {
             path: path_str.clone(),
             content,
         };
 
-        let json = serde_json::to_string(&content_message).unwrap();
-        write_half.write_all(json.as_bytes()).await.unwrap();
-        write_half.write_all(b"\n").await.unwrap();
+        let json = serde_json::to_string(&content_message)?;
+        write_half.write_all(json.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
 
         println!("Sent(changed/new): {}", path_str);   
     }
 
     for (deleted_path, value) in server_manifest {
-        match value {
-            Some(_) => {
-                let delete_message = SyncMessage::DeleteFile {path: deleted_path.clone()};
-                let json = serde_json::to_string(&delete_message).unwrap();
-                write_half.write_all(json.as_bytes()).await.unwrap();
-                write_half.write_all(b"\n").await.unwrap();
-                println!("Sent(deleted file): {}", deleted_path);
-            }
-            None => {
-                let remove_message = SyncMessage::RemoveDir {path: deleted_path.clone()};
-                let json = serde_json::to_string(&remove_message).unwrap();
-                write_half.write_all(json.as_bytes()).await.unwrap();
-                write_half.write_all(b"\n").await.unwrap();
-                println!("Sent(removed directory): {}", deleted_path);
-            }
-        }
-    }
+        let message = match value {
+            Some(_) => SyncMessage::DeleteFile { path: deleted_path.clone() },
+            None => SyncMessage::RemoveDir { path: deleted_path.clone() },
+        };
 
-    let complete_message = SyncMessage::SyncComplete;
-    let json = serde_json::to_string(&complete_message).unwrap();
-    write_half.write_all(json.as_bytes()).await.unwrap();
-    write_half.write_all(b"\n").await.unwrap();
+        let json = serde_json::to_string(&message)?;
+        write_half.write_all(json.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        println!("Sent(delete/remove): {}", deleted_path);
+    }
     
     println!("Sent: SyncComplete");
+    Ok(())
 }
