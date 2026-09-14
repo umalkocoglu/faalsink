@@ -4,6 +4,8 @@ use crate::file_scanner::FileInfo;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SyncMessage {
+    // Sent by client, first message on the wire.
+    Auth { token: String },
     // Sent by client.
     FileInfo(FileInfo),
     FileContentStream { path: String }, // chunked LZ4 byte stream follows on the wire

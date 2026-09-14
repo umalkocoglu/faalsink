@@ -14,17 +14,31 @@ use file_scanner::{scan_directory, normalize_path};
 
 #[tokio::main]
 async fn main() -> Result<()>{
+    // Shared secret used to authenticate against the server. Plaintext over
+    // the wire (no TLS yet), so this guards against stray/accidental
+    // connections rather than a determined network attacker.
+    let token = std::env::var("SYNC_SHARED_SECRET")
+        .context("SYNC_SHARED_SECRET environment variable must be set")?;
+
     let stream = TcpStream::connect("127.0.0.1:8080")
         .await
         .context("Could not connect to server, make sure the server is running.")?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    let auth_message = SyncMessage::Auth { token };
+    let json = serde_json::to_string(&auth_message)?;
+    write_half.write_all(json.as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
 
     let mut line = String::new();
-    reader.read_line(&mut line)
+    let bytes_read = reader.read_line(&mut line)
         .await
         .context("Could not read line from server")?;
+
+    if bytes_read == 0 {
+        anyhow::bail!("Server closed the connection - authentication was likely rejected");
+    }
 
     let mut server_manifest: HashMap<String, Option<String>> = match serde_json::from_str::<SyncMessage>(line.trim()) {
         Ok(SyncMessage::Manifest(manifest)) => manifest,
@@ -86,8 +100,6 @@ async fn main() -> Result<()>{
         write_half.write_all(json.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
 
-        // Read the file in 64 KB chunks, LZ4-compress each one, and stream it:
-        // [4-byte compressed length][compressed bytes], terminated by a 0 length.
         let mut buffer = [0u8; 65536];
 
         loop {

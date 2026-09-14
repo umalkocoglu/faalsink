@@ -5,7 +5,14 @@ use crate::protocol::SyncMessage;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf, Component};
-use crate::file_scanner::build_manifest;
+use std::sync::Arc;
+use crate::file_scanner::{build_manifest, FileInfo};
+
+/// Chunks are always <= 64 KB before compression, and LZ4 never expands
+/// data by much. Anything claiming to be bigger than this is either a
+/// corrupt stream or a hostile length field - reject it instead of
+/// allocating whatever size it asks for.
+const MAX_CHUNK_LEN: u32 = 1024 * 1024; // 1 MB
 
 fn build_safe_path(base: &str, user_path: &str) -> Result<PathBuf, &'static str> {
     let path = Path::new(user_path);
@@ -24,11 +31,16 @@ fn build_safe_path(base: &str, user_path: &str) -> Result<PathBuf, &'static str>
 
 /// Consumes and discards a chunked byte stream (used when we can't accept the
 /// incoming file) so the reader stays aligned on the next JSON line.
+/// Bails out instead of draining if a chunk claims to exceed MAX_CHUNK_LEN,
+/// since at that point we can no longer trust the stream at all.
 async fn drain_stream(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<()> {
     loop {
         let chunk_len = reader.read_u32().await?;
         if chunk_len == 0 {
             break;
+        }
+        if chunk_len > MAX_CHUNK_LEN {
+            anyhow::bail!("Chunk length {} exceeds the {}-byte limit", chunk_len, MAX_CHUNK_LEN);
         }
         let mut trash = vec![0u8; chunk_len as usize];
         reader.read_exact(&mut trash).await?;
@@ -36,9 +48,29 @@ async fn drain_stream(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) ->
     Ok(())
 }
 
-async fn handle_connection(socket: TcpStream, addr: SocketAddr) -> Result<()> {
+async fn handle_connection(socket: TcpStream, addr: SocketAddr, expected_token: Arc<String>) -> Result<()> {
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
+
+    // First message on the wire must be Auth with a matching token.
+    let mut auth_line = String::new();
+    let bytes_read = reader.read_line(&mut auth_line).await?;
+    if bytes_read == 0 {
+        println!("Connection closed by {} before authenticating", addr);
+        return Ok(());
+    }
+
+    let authenticated = matches!(
+        serde_json::from_str::<SyncMessage>(auth_line.trim()),
+        Ok(SyncMessage::Auth { token }) if token == *expected_token
+    );
+
+    if !authenticated {
+        eprintln!("Rejected connection from {}: authentication failed", addr);
+        return Ok(());
+    }
+
+    println!("Authenticated connection from {}", addr);
 
     let manifest = build_manifest("received_files");
     let manifest_message = SyncMessage::Manifest(manifest);
@@ -47,6 +79,10 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) -> Result<()> {
     write_half.write_all(json.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
     println!("Sent manifest to {}: {}", addr, json);
+
+    // Set by FileInfo, consumed by the FileContentStream that immediately
+    // follows it - this pairing order is guaranteed by client.rs.
+    let mut pending_file: Option<FileInfo> = None;
 
     let mut line = String::new();
     loop {
@@ -61,13 +97,19 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) -> Result<()> {
                 match serde_json::from_str::<SyncMessage>(line.trim()) {
                     Ok(message) => {
                         match message {
+                            SyncMessage::Auth { .. } => {
+                                println!("Unexpected second Auth message from {}, ignoring.", addr);
+                            }
                             SyncMessage::FileInfo(file_info) => {
                                 println!("Received FileInfo from {}: {:?}", addr, file_info);
+                                pending_file = Some(file_info);
                             }
                             SyncMessage::SyncComplete => {
                                 println!("Received SyncComplete from {}", addr);
                             }
                             SyncMessage::FileContentStream { path } => {
+                                let expected_hash = pending_file.take().and_then(|info| info.hash);
+
                                 match build_safe_path("received_files", &path) {
                                     Ok(safe_path) => {
                                         if let Some(parent) = safe_path.parent() {
@@ -76,11 +118,37 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) -> Result<()> {
 
                                         match tokio::fs::File::create(&safe_path).await {
                                             Ok(mut file) => {
+                                                let mut hasher = blake3::Hasher::new();
+
                                                 loop {
                                                     let chunk_len = reader.read_u32().await?;
                                                     if chunk_len == 0 {
-                                                        println!("Saved (LZ4) to: {}", safe_path.display());
+                                                        let actual_hash = hasher.finalize().to_string();
+                                                        match &expected_hash {
+                                                            Some(expected) if *expected == actual_hash => {
+                                                                println!("Saved (LZ4, hash verified) to: {}", safe_path.display());
+                                                            }
+                                                            Some(expected) => {
+                                                                eprintln!(
+                                                                    "Hash mismatch for {}: expected {}, got {} - removing corrupted file",
+                                                                    safe_path.display(), expected, actual_hash
+                                                                );
+                                                                let _ = tokio::fs::remove_file(&safe_path).await;
+                                                            }
+                                                            None => {
+                                                                println!("Saved (LZ4, no hash to verify) to: {}", safe_path.display());
+                                                            }
+                                                        }
                                                         break;
+                                                    }
+
+                                                    if chunk_len > MAX_CHUNK_LEN {
+                                                        eprintln!(
+                                                            "Chunk length {} from {} exceeds the {}-byte limit, closing connection",
+                                                            chunk_len, addr, MAX_CHUNK_LEN
+                                                        );
+                                                        let _ = tokio::fs::remove_file(&safe_path).await;
+                                                        anyhow::bail!("Chunk length exceeded limit");
                                                     }
 
                                                     let mut comp_buf = vec![0u8; chunk_len as usize];
@@ -88,14 +156,16 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) -> Result<()> {
 
                                                     match lz4_flex::decompress_size_prepended(&comp_buf) {
                                                         Ok(decompressed) => {
+                                                            hasher.update(&decompressed);
                                                             file.write_all(&decompressed).await?;
                                                         }
                                                         Err(e) => {
                                                             eprintln!("LZ4 decode error for {}: {}", path, e);
                                                             // Data is corrupt; drain the rest of this
-                                                            // file's stream and move on to the next
-                                                            // message instead of killing the connection.
+                                                            // file's stream, remove the partial file, and
+                                                            // move on to the next message.
                                                             drain_stream(&mut reader).await?;
+                                                            let _ = tokio::fs::remove_file(&safe_path).await;
                                                             break;
                                                         }
                                                     }
@@ -167,6 +237,11 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) -> Result<()> {
 }
 
 pub async fn run_server() -> Result<()> {
+    let shared_secret = Arc::new(
+        std::env::var("SYNC_SHARED_SECRET")
+            .context("SYNC_SHARED_SECRET environment variable must be set")?,
+    );
+
     let listener = TcpListener::bind("127.0.0.1:8080").await.context("Could not bind the server")?;
     println!("Server listening on: 127.0.0.1:8080");
 
@@ -184,9 +259,10 @@ pub async fn run_server() -> Result<()> {
         };
 
         println!("New connection from: {}", addr);
+        let secret = shared_secret.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, addr).await {
+            if let Err(e) = handle_connection(socket, addr, secret).await {
                 eprintln!("Connection with {} ended with error: {}", addr, e);
             }
         });
