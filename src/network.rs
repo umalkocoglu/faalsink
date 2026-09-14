@@ -3,9 +3,10 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncBufReadExt, BufReader};
 use anyhow::{Context, Result};
 use crate::protocol::SyncMessage;
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf, Component};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tracing::{debug, error, info, warn, Instrument};
 use crate::file_scanner::{build_manifest, FileInfo};
 
 /// Chunks are always <= 64 KB before compression, and LZ4 never expands
@@ -13,6 +14,13 @@ use crate::file_scanner::{build_manifest, FileInfo};
 /// corrupt stream or a hostile length field - reject it instead of
 /// allocating whatever size it asks for.
 const MAX_CHUNK_LEN: u32 = 1024 * 1024; // 1 MB
+
+/// Monotonically increasing id handed out per accepted connection, purely
+/// for log correlation - lets us grep all lines for one sync session
+/// (`conn_id=7`) even while other clients are connected concurrently.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+type ConnReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
 
 fn build_safe_path(base: &str, user_path: &str) -> Result<PathBuf, &'static str> {
     let path = Path::new(user_path);
@@ -33,7 +41,7 @@ fn build_safe_path(base: &str, user_path: &str) -> Result<PathBuf, &'static str>
 /// incoming file) so the reader stays aligned on the next JSON line.
 /// Bails out instead of draining if a chunk claims to exceed MAX_CHUNK_LEN,
 /// since at that point we can no longer trust the stream at all.
-async fn drain_stream(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<()> {
+async fn drain_stream(reader: &mut ConnReader) -> Result<()> {
     loop {
         let chunk_len = reader.read_u32().await?;
         if chunk_len == 0 {
@@ -48,7 +56,79 @@ async fn drain_stream(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) ->
     Ok(())
 }
 
-async fn handle_connection(socket: TcpStream, addr: SocketAddr, expected_token: Arc<String>) -> Result<()> {
+/// Receives one chunked, LZ4-compressed file body and writes it to disk,
+/// verifying it against `expected_hash` once the stream ends. Runs inside
+/// its own `file_transfer` span (see call site), so every log line here
+/// already carries the file path - no need to repeat it in each message.
+async fn handle_file_stream(reader: &mut ConnReader, path: &str, expected_hash: Option<String>) -> Result<()> {
+    let safe_path = match build_safe_path("received_files", path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "rejected path (possible path traversal)");
+            return drain_stream(reader).await;
+        }
+    };
+
+    if let Some(parent) = safe_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut file = match tokio::fs::File::create(&safe_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!(error = %e, "could not create file");
+            return drain_stream(reader).await;
+        }
+    };
+
+    let mut hasher = blake3::Hasher::new();
+
+    loop {
+        let chunk_len = reader.read_u32().await?;
+        if chunk_len == 0 {
+            let actual_hash = hasher.finalize().to_string();
+            match &expected_hash {
+                Some(expected) if *expected == actual_hash => {
+                    info!("file saved, hash verified");
+                }
+                Some(expected) => {
+                    error!(expected = %expected, actual = %actual_hash, "hash mismatch, removing corrupted file");
+                    let _ = tokio::fs::remove_file(&safe_path).await;
+                }
+                None => {
+                    info!("file saved (no hash to verify)");
+                }
+            }
+            return Ok(());
+        }
+
+        if chunk_len > MAX_CHUNK_LEN {
+            error!(chunk_len, max = MAX_CHUNK_LEN, "chunk length exceeds limit, closing connection");
+            let _ = tokio::fs::remove_file(&safe_path).await;
+            anyhow::bail!("Chunk length exceeded limit");
+        }
+
+        let mut comp_buf = vec![0u8; chunk_len as usize];
+        reader.read_exact(&mut comp_buf).await?;
+
+        match lz4_flex::decompress_size_prepended(&comp_buf) {
+            Ok(decompressed) => {
+                hasher.update(&decompressed);
+                file.write_all(&decompressed).await?;
+            }
+            Err(e) => {
+                error!(error = %e, "lz4 decode error");
+                // Data is corrupt; drain the rest of this file's stream,
+                // remove the partial file, and move on to the next message.
+                drain_stream(reader).await?;
+                let _ = tokio::fs::remove_file(&safe_path).await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn handle_connection(socket: TcpStream, expected_token: Arc<String>) -> Result<()> {
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -56,7 +136,7 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr, expected_token: 
     let mut auth_line = String::new();
     let bytes_read = reader.read_line(&mut auth_line).await?;
     if bytes_read == 0 {
-        println!("Connection closed by {} before authenticating", addr);
+        info!("connection closed before authenticating");
         return Ok(());
     }
 
@@ -66,11 +146,11 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr, expected_token: 
     );
 
     if !authenticated {
-        eprintln!("Rejected connection from {}: authentication failed", addr);
+        warn!("authentication failed, closing connection");
         return Ok(());
     }
 
-    println!("Authenticated connection from {}", addr);
+    info!("authenticated");
 
     let manifest = build_manifest("received_files");
     let manifest_message = SyncMessage::Manifest(manifest);
@@ -78,7 +158,7 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr, expected_token: 
 
     write_half.write_all(json.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
-    println!("Sent manifest to {}: {}", addr, json);
+    debug!(%json, "sent manifest");
 
     // Set by FileInfo, consumed by the FileContentStream that immediately
     // follows it - this pairing order is guaranteed by client.rs.
@@ -90,7 +170,7 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr, expected_token: 
 
         match reader.read_line(&mut line).await {
             Ok(0) => {
-                println!("Connection closed by client: {}", addr);
+                info!("connection closed by client");
                 break;
             }
             Ok(_) => {
@@ -98,136 +178,67 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr, expected_token: 
                     Ok(message) => {
                         match message {
                             SyncMessage::Auth { .. } => {
-                                println!("Unexpected second Auth message from {}, ignoring.", addr);
+                                warn!("duplicate auth message, ignoring");
                             }
                             SyncMessage::FileInfo(file_info) => {
-                                println!("Received FileInfo from {}: {:?}", addr, file_info);
+                                debug!(?file_info, "received file info");
                                 pending_file = Some(file_info);
                             }
                             SyncMessage::SyncComplete => {
-                                println!("Received SyncComplete from {}", addr);
+                                info!("sync complete");
                             }
                             SyncMessage::FileContentStream { path } => {
                                 let expected_hash = pending_file.take().and_then(|info| info.hash);
-
-                                match build_safe_path("received_files", &path) {
-                                    Ok(safe_path) => {
-                                        if let Some(parent) = safe_path.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-
-                                        match tokio::fs::File::create(&safe_path).await {
-                                            Ok(mut file) => {
-                                                let mut hasher = blake3::Hasher::new();
-
-                                                loop {
-                                                    let chunk_len = reader.read_u32().await?;
-                                                    if chunk_len == 0 {
-                                                        let actual_hash = hasher.finalize().to_string();
-                                                        match &expected_hash {
-                                                            Some(expected) if *expected == actual_hash => {
-                                                                println!("Saved (LZ4, hash verified) to: {}", safe_path.display());
-                                                            }
-                                                            Some(expected) => {
-                                                                eprintln!(
-                                                                    "Hash mismatch for {}: expected {}, got {} - removing corrupted file",
-                                                                    safe_path.display(), expected, actual_hash
-                                                                );
-                                                                let _ = tokio::fs::remove_file(&safe_path).await;
-                                                            }
-                                                            None => {
-                                                                println!("Saved (LZ4, no hash to verify) to: {}", safe_path.display());
-                                                            }
-                                                        }
-                                                        break;
-                                                    }
-
-                                                    if chunk_len > MAX_CHUNK_LEN {
-                                                        eprintln!(
-                                                            "Chunk length {} from {} exceeds the {}-byte limit, closing connection",
-                                                            chunk_len, addr, MAX_CHUNK_LEN
-                                                        );
-                                                        let _ = tokio::fs::remove_file(&safe_path).await;
-                                                        anyhow::bail!("Chunk length exceeded limit");
-                                                    }
-
-                                                    let mut comp_buf = vec![0u8; chunk_len as usize];
-                                                    reader.read_exact(&mut comp_buf).await?;
-
-                                                    match lz4_flex::decompress_size_prepended(&comp_buf) {
-                                                        Ok(decompressed) => {
-                                                            hasher.update(&decompressed);
-                                                            file.write_all(&decompressed).await?;
-                                                        }
-                                                        Err(e) => {
-                                                            eprintln!("LZ4 decode error for {}: {}", path, e);
-                                                            // Data is corrupt; drain the rest of this
-                                                            // file's stream, remove the partial file, and
-                                                            // move on to the next message.
-                                                            drain_stream(&mut reader).await?;
-                                                            let _ = tokio::fs::remove_file(&safe_path).await;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Could not create file {}: {}", safe_path.display(), e);
-                                                drain_stream(&mut reader).await?;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Rejected (Path Traversal) {}: {}", addr, e);
-                                        drain_stream(&mut reader).await?;
-                                    }
-                                }
+                                let file_span = tracing::info_span!("file_transfer", path = %path);
+                                handle_file_stream(&mut reader, &path, expected_hash)
+                                    .instrument(file_span)
+                                    .await?;
                             }
                             SyncMessage::DeleteFile { path } => {
                                 match build_safe_path("received_files", &path) {
                                     Ok(safe_path) => {
                                         match std::fs::remove_file(&safe_path) {
-                                            Ok(_) => println!("Deleted File: {}", safe_path.display()),
-                                            Err(e) => eprintln!("Could not delete file {}: {}", safe_path.display(), e),
+                                            Ok(_) => info!(path = %safe_path.display(), "deleted file"),
+                                            Err(e) => error!(path = %safe_path.display(), error = %e, "could not delete file"),
                                         }
                                     }
-                                    Err(e) => eprintln!("Rejected (DeleteFile) {}: {}", addr, e),
+                                    Err(e) => warn!(error = %e, "rejected delete (possible path traversal)"),
                                 }
                             }
                             SyncMessage::CreateDir { path } => {
                                 match build_safe_path("received_files", &path) {
                                     Ok(safe_path) => {
                                         match std::fs::create_dir_all(&safe_path) {
-                                            Ok(_) => println!("Created directory: {}", safe_path.display()),
-                                            Err(e) => eprintln!("Could not create directory {}: {}", safe_path.display(), e),
+                                            Ok(_) => info!(path = %safe_path.display(), "created directory"),
+                                            Err(e) => error!(path = %safe_path.display(), error = %e, "could not create directory"),
                                         }
                                     }
-                                    Err(e) => eprintln!("Rejected (CreateDir) {}: {}", addr, e),
+                                    Err(e) => warn!(error = %e, "rejected create-dir (possible path traversal)"),
                                 }
                             }
                             SyncMessage::RemoveDir { path } => {
                                 match build_safe_path("received_files", &path) {
                                     Ok(safe_path) => {
                                         match std::fs::remove_dir_all(&safe_path) {
-                                            Ok(_) => println!("Removed directory: {}", safe_path.display()),
-                                            Err(e) => eprintln!("Could not remove directory {}: {}", safe_path.display(), e),
+                                            Ok(_) => info!(path = %safe_path.display(), "removed directory"),
+                                            Err(e) => error!(path = %safe_path.display(), error = %e, "could not remove directory"),
                                         }
                                     }
-                                    Err(e) => eprintln!("Rejected (RemoveDir) {}: {}", addr, e),
+                                    Err(e) => warn!(error = %e, "rejected remove-dir (possible path traversal)"),
                                 }
                             }
                             SyncMessage::Manifest(_) => {
-                                println!("Unexpected Manifest message from {}.", addr);
+                                warn!("unexpected manifest message from client");
                             }
                         }
                     }
                     Err(err) => {
-                        eprintln!("Failed to parse JSON from {}: {}", addr, err);
+                        warn!(error = %err, raw_line = %line.trim(), "failed to parse JSON");
                     }
                 }
             }
             Err(err) => {
-                eprintln!("Network error while reading from {}: {}", addr, err);
+                error!(error = %err, "network error while reading");
                 break;
             }
         }
@@ -243,28 +254,34 @@ pub async fn run_server() -> Result<()> {
     );
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.context("Could not bind the server")?;
-    println!("Server listening on: 127.0.0.1:8080");
+    info!("server listening on 127.0.0.1:8080");
 
     if let Err(e) = std::fs::create_dir_all("received_files") {
-        eprintln!("Warning! Could not create the directory received_files: {}", e);
+        warn!(error = %e, "could not create received_files directory");
     }
 
     loop {
         let (socket, addr) = match listener.accept().await {
             Ok(res) => res,
             Err(e) => {
-                eprintln!("Connection could not be accepted: {}", e);
+                error!(error = %e, "connection could not be accepted");
                 continue;
             }
         };
 
-        println!("New connection from: {}", addr);
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let span = tracing::info_span!("sync_session", conn_id, %addr);
+        span.in_scope(|| info!("new connection accepted"));
+
         let secret = shared_secret.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, addr, secret).await {
-                eprintln!("Connection with {} ended with error: {}", addr, e);
+        tokio::spawn(
+            async move {
+                if let Err(e) = handle_connection(socket, secret).await {
+                    error!(error = %e, "connection ended with error");
+                }
             }
-        });
+                .instrument(span),
+        );
     }
 }
