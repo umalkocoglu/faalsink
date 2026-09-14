@@ -2,6 +2,7 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncBufReadExt, BufReader};
 use std::collections::HashMap;
 use anyhow::{Context, Result};
+use tracing::{debug, info, warn};
 
 #[path = "../protocol.rs"]
 mod protocol;
@@ -14,6 +15,10 @@ use file_scanner::{scan_directory, normalize_path};
 
 #[tokio::main]
 async fn main() -> Result<()>{
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Shared secret used to authenticate against the server. Plaintext over
     // the wire (no TLS yet), so this guards against stray/accidental
     // connections rather than a determined network attacker.
@@ -43,12 +48,12 @@ async fn main() -> Result<()>{
     let mut server_manifest: HashMap<String, Option<String>> = match serde_json::from_str::<SyncMessage>(line.trim()) {
         Ok(SyncMessage::Manifest(manifest)) => manifest,
         _ => {
-            eprintln!("Expected Manifest message, got something else.");
+            warn!("expected Manifest message, got something else");
             HashMap::new()
         }
     };
 
-    println!("Received manifest from server: {} files", server_manifest.len());
+    info!(file_count = server_manifest.len(), "received manifest from server");
 
     let files = scan_directory(".");
 
@@ -64,7 +69,7 @@ async fn main() -> Result<()>{
                 let json = serde_json::to_string(&message)?;
                 write_half.write_all(json.as_bytes()).await?;
                 write_half.write_all(b"\n").await?;
-                println!("Sent (created directory): {}", path_str);
+                info!(path = %path_str, "sent create-directory");
             }
 
             continue;
@@ -78,14 +83,17 @@ async fn main() -> Result<()>{
         server_manifest.remove(&path_str);
 
         if !needs_sync {
-            println!("File {} is up to date, skipping.", path_str);
+            debug!(path = %path_str, "up to date, skipping");
             continue;
         }
 
+        // Open the file BEFORE announcing anything to the server. If this fails
+        // we skip the file silently instead of leaving the server waiting for a
+        // FileContentStream that never arrives (protocol desync).
         let mut f = match tokio::fs::File::open(&file.path).await {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("Warning: {} could not be opened, skipping... Error: {}", path_str, e);
+                warn!(path = %path_str, error = %e, "could not open file, skipping");
                 continue;
             }
         };
@@ -95,11 +103,14 @@ async fn main() -> Result<()>{
         write_half.write_all(json.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
 
+        // Tell the server a chunked, LZ4-compressed byte stream follows.
         let stream_msg = SyncMessage::FileContentStream { path: path_str.clone() };
         let json = serde_json::to_string(&stream_msg)?;
         write_half.write_all(json.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
 
+        // Read the file in 64 KB chunks, LZ4-compress each one, and stream it:
+        // [4-byte compressed length][compressed bytes], terminated by a 0 length.
         let mut buffer = [0u8; 65536];
 
         loop {
@@ -114,7 +125,7 @@ async fn main() -> Result<()>{
             write_half.write_all(&compressed).await?;
         }
 
-        println!("Sent: {}", path_str);
+        info!(path = %path_str, "sent (LZ4 chunked)");
     }
 
     for (deleted_path, value) in server_manifest {
@@ -126,14 +137,14 @@ async fn main() -> Result<()>{
         let json = serde_json::to_string(&message)?;
         write_half.write_all(json.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
-        println!("Sent(delete/remove): {}", deleted_path);
+        info!(path = %deleted_path, "sent delete/remove");
     }
 
     let complete_message = SyncMessage::SyncComplete;
     let json = serde_json::to_string(&complete_message)?;
     write_half.write_all(json.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
-    println!("Sent: SyncComplete");
+    info!("sent SyncComplete");
 
     Ok(())
 }

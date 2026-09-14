@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use walkdir::WalkDir;
 use std::collections::HashMap;
+use tracing::warn;
 
 use serde::{Serialize, Deserialize};
 
@@ -22,7 +23,7 @@ pub fn scan_directory(root: &str) -> Vec<FileInfo> {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                eprintln!("Error reading entry: {}", err);
+                warn!(error = %err, "error reading directory entry");
                 continue;
             }
         };
@@ -42,7 +43,7 @@ pub fn scan_directory(root: &str) -> Vec<FileInfo> {
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(err) => {
-                eprintln!("Error reading metadata for {}: {}", path.display(), err);
+                warn!(path = %path.display(), error = %err, "error reading metadata");
                 continue;
             }
         };
@@ -62,7 +63,7 @@ pub fn scan_directory(root: &str) -> Vec<FileInfo> {
         let hash = match hash_file(path) {
             Ok(h) => h,
             Err(err) => {
-                eprintln!("Error reading file {}: {}", path.display(), err);
+                warn!(path = %path.display(), error = %err, "error hashing file");
                 continue;
             }
         };
@@ -78,6 +79,8 @@ pub fn scan_directory(root: &str) -> Vec<FileInfo> {
     files
 }
 
+/// Hashes a file in fixed-size chunks instead of loading it fully into memory,
+/// so scanning stays cheap even for very large files. yay!
 fn hash_file(path: &std::path::Path) -> std::io::Result<String> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
