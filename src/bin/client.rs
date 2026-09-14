@@ -3,6 +3,7 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncBufReadExt, BufReader};
 use std::collections::HashMap;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[path = "../protocol.rs"]
 mod protocol;
@@ -12,12 +13,27 @@ use protocol::SyncMessage;
 mod file_scanner;
 use file_scanner::{scan_directory, normalize_path};
 
+/// Same dual stdout+JSON-file setup as the server (see main.rs's
+/// init_tracing doc comment) - logs to logs/client.log.<date>.
+fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+    let _ = std::fs::create_dir_all("logs");
+    let file_appender = tracing_appender::rolling::daily("logs", "client.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer())
+        .with(fmt::layer().with_writer(non_blocking).with_ansi(false).json())
+        .init();
+
+    guard
+}
 
 #[tokio::main]
 async fn main() -> Result<()>{
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let _log_guard = init_tracing();
 
     // Shared secret used to authenticate against the server. Plaintext over
     // the wire (no TLS yet), so this guards against stray/accidental
