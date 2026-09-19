@@ -1,6 +1,4 @@
-mod network;
-mod file_scanner;
-mod protocol;
+use faalsink::network;
 
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 

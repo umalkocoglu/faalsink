@@ -5,13 +5,8 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-#[path = "../protocol.rs"]
-mod protocol;
-use protocol::SyncMessage;
-
-#[path = "../file_scanner.rs"]
-mod file_scanner;
-use file_scanner::{scan_directory, normalize_path};
+use faalsink::protocol::SyncMessage;
+use faalsink::file_scanner::{scan_directory, normalize_path};
 
 /// Same dual stdout+JSON-file setup as the server (see main.rs's
 /// init_tracing doc comment) - logs to logs/client.log.<date>.

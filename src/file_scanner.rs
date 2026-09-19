@@ -116,3 +116,54 @@ pub fn normalize_path(path: &PathBuf, root: &str) -> String {
     };
     path_str.replace("\\", "/")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn hash_file_matches_blake3_of_its_contents() {
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp.write_all(b"hello, sync tool").expect("write temp file");
+        tmp.flush().expect("flush temp file");
+
+        let expected = blake3::hash(b"hello, sync tool").to_string();
+        let actual = hash_file(tmp.path()).expect("hash file");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hash_file_is_correct_across_multiple_read_buffer_chunks() {
+        // Bigger than the 64 KB buffer hash_file reads with internally, to
+        // make sure chunked reading doesn't change the resulting hash.
+        let data = vec![0xABu8; 200_000];
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp.write_all(&data).expect("write temp file");
+        tmp.flush().expect("flush temp file");
+
+        let expected = blake3::hash(&data).to_string();
+        let actual = hash_file(tmp.path()).expect("hash file");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hash_file_errors_on_a_missing_file() {
+        let missing = std::path::Path::new("this/path/does/not/exist.bin");
+        assert!(hash_file(missing).is_err());
+    }
+
+    #[test]
+    fn normalize_path_strips_root_and_uses_forward_slashes() {
+        let full = PathBuf::from(".").join("sub").join("dir").join("file.txt");
+        assert_eq!(normalize_path(&full, "."), "sub/dir/file.txt");
+    }
+
+    #[test]
+    fn normalize_path_falls_back_to_full_path_when_root_does_not_match() {
+        let full = PathBuf::from("unrelated/file.txt");
+        assert_eq!(normalize_path(&full, "received_files"), "unrelated/file.txt");
+    }
+}

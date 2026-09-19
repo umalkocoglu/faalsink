@@ -296,6 +296,16 @@ async fn run_sync_loop(reader: &mut ConnReader, write_half: &mut ConnWriter, sta
     Ok(())
 }
 
+/// Pure check: does `line` deserialize into a matching Auth message?
+/// Split out of handle_connection purely so it's unit-testable without a
+/// real TCP connection.
+fn verify_auth(line: &str, expected_token: &str) -> bool {
+    matches!(
+        serde_json::from_str::<SyncMessage>(line.trim()),
+        Ok(SyncMessage::Auth { token }) if token == expected_token
+    )
+}
+
 async fn handle_connection(socket: TcpStream, expected_token: Arc<String>) -> Result<()> {
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
@@ -389,5 +399,64 @@ pub async fn run_server() -> Result<()> {
             }
                 .instrument(span),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- build_safe_path: path traversal protection ---
+
+    #[test]
+    fn safe_path_joins_a_normal_relative_path() {
+        let result = build_safe_path("received_files", "sub/dir/file.txt").unwrap();
+        // Compare against the same join logic rather than a hardcoded
+        // string, so this passes regardless of the platform's separator.
+        let expected = Path::new("received_files").join("sub/dir/file.txt");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn safe_path_rejects_leading_parent_dir() {
+        assert!(build_safe_path("received_files", "../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_path_rejects_parent_dir_hidden_in_the_middle() {
+        // "a/../../b" doesn't start with "..", but still contains a
+        // ParentDir component once the path is parsed - must be rejected.
+        assert!(build_safe_path("received_files", "a/../../b").is_err());
+    }
+
+    #[test]
+    fn safe_path_rejects_absolute_path() {
+        assert!(build_safe_path("received_files", "/etc/passwd").is_err());
+    }
+
+    // --- verify_auth: authentication ---
+
+    #[test]
+    fn verify_auth_accepts_matching_token() {
+        let line = r#"{"Auth":{"token":"secret123"}}"#;
+        assert!(verify_auth(line, "secret123"));
+    }
+
+    #[test]
+    fn verify_auth_rejects_wrong_token() {
+        let line = r#"{"Auth":{"token":"wrong"}}"#;
+        assert!(!verify_auth(line, "secret123"));
+    }
+
+    #[test]
+    fn verify_auth_rejects_malformed_json() {
+        assert!(!verify_auth("not json at all", "secret123"));
+    }
+
+    // A well-formed SyncMessage that just isn't Auth must not pass.
+    #[test]
+    fn verify_auth_rejects_a_different_message_type() {
+        let line = r#""SyncComplete""#;
+        assert!(!verify_auth(line, "secret123"));
     }
 }
