@@ -6,21 +6,40 @@ use crate::protocol::SyncMessage;
 use std::path::{Path, PathBuf, Component};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn, Instrument};
 use crate::file_scanner::{build_manifest, FileInfo};
 
 /// Chunks are always <= 64 KB before compression, and LZ4 never expands
 /// data by much. Anything claiming to be bigger than this is either a
-/// corrupt stream or a hostile length field - reject it instead of
-/// allocating whatever size it asks for.
+/// corrupt stream or a hostile length field - reject instead of
+/// allocating
 const MAX_CHUNK_LEN: u32 = 1024 * 1024; // 1 MB
 
 /// Monotonically increasing id handed out per accepted connection, purely
-/// for log correlation - lets us grep all lines for one sync session
+/// for log correlation - lets you grep all lines for one sync session
 /// (`conn_id=7`) even while other clients are connected concurrently.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 type ConnReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
+type ConnWriter = tokio::net::tcp::OwnedWriteHalf;
+
+/// Tallied over one sync session and emitted as a single summary record
+/// when the session ends (see the end of handle_connection)
+#[derive(Default)]
+struct SessionStats {
+    files_saved: u64,
+    bytes_written: u64,
+    files_deleted: u64,
+    dirs_created: u64,
+    dirs_removed: u64,
+    errors: u64,
+}
+
+enum FileOutcome {
+    Saved { bytes: u64 },
+    Rejected,
+}
 
 fn build_safe_path(base: &str, user_path: &str) -> Result<PathBuf, &'static str> {
     let path = Path::new(user_path);
@@ -60,12 +79,19 @@ async fn drain_stream(reader: &mut ConnReader) -> Result<()> {
 /// verifying it against `expected_hash` once the stream ends. Runs inside
 /// its own `file_transfer` span (see call site), so every log line here
 /// already carries the file path - no need to repeat it in each message.
-async fn handle_file_stream(reader: &mut ConnReader, path: &str, expected_hash: Option<String>) -> Result<()> {
+///
+/// Returns Ok(FileOutcome::Rejected) for recoverable problems (bad path,
+/// can't create the file, hash mismatch, corrupt chunk) - the connection
+/// stays open and moves on to the next message. Only a chunk length over
+/// the limit is fatal (Err), since at that point the stream can't be
+/// trusted at all.
+async fn handle_file_stream(reader: &mut ConnReader, path: &str, expected_hash: Option<String>) -> Result<FileOutcome> {
     let safe_path = match build_safe_path("received_files", path) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "rejected path (possible path traversal)");
-            return drain_stream(reader).await;
+            drain_stream(reader).await?;
+            return Ok(FileOutcome::Rejected);
         }
     };
 
@@ -77,29 +103,33 @@ async fn handle_file_stream(reader: &mut ConnReader, path: &str, expected_hash: 
         Ok(f) => f,
         Err(e) => {
             error!(error = %e, "could not create file");
-            return drain_stream(reader).await;
+            drain_stream(reader).await?;
+            return Ok(FileOutcome::Rejected);
         }
     };
 
     let mut hasher = blake3::Hasher::new();
+    let mut bytes_written: u64 = 0;
 
     loop {
         let chunk_len = reader.read_u32().await?;
         if chunk_len == 0 {
             let actual_hash = hasher.finalize().to_string();
-            match &expected_hash {
+            return match &expected_hash {
                 Some(expected) if *expected == actual_hash => {
-                    info!("file saved, hash verified");
+                    info!(bytes = bytes_written, "file saved, hash verified");
+                    Ok(FileOutcome::Saved { bytes: bytes_written })
                 }
                 Some(expected) => {
                     error!(expected = %expected, actual = %actual_hash, "hash mismatch, removing corrupted file");
                     let _ = tokio::fs::remove_file(&safe_path).await;
+                    Ok(FileOutcome::Rejected)
                 }
                 None => {
-                    info!("file saved (no hash to verify)");
+                    info!(bytes = bytes_written, "file saved (no hash to verify)");
+                    Ok(FileOutcome::Saved { bytes: bytes_written })
                 }
-            }
-            return Ok(());
+            };
         }
 
         if chunk_len > MAX_CHUNK_LEN {
@@ -113,6 +143,7 @@ async fn handle_file_stream(reader: &mut ConnReader, path: &str, expected_hash: 
 
         match lz4_flex::decompress_size_prepended(&comp_buf) {
             Ok(decompressed) => {
+                bytes_written += decompressed.len() as u64;
                 hasher.update(&decompressed);
                 file.write_all(&decompressed).await?;
             }
@@ -122,36 +153,17 @@ async fn handle_file_stream(reader: &mut ConnReader, path: &str, expected_hash: 
                 // remove the partial file, and move on to the next message.
                 drain_stream(reader).await?;
                 let _ = tokio::fs::remove_file(&safe_path).await;
-                return Ok(());
+                return Ok(FileOutcome::Rejected);
             }
         }
     }
 }
 
-async fn handle_connection(socket: TcpStream, expected_token: Arc<String>) -> Result<()> {
-    let (read_half, mut write_half) = socket.into_split();
-    let mut reader = BufReader::new(read_half);
-
-    // First message on the wire must be Auth with a matching token.
-    let mut auth_line = String::new();
-    let bytes_read = reader.read_line(&mut auth_line).await?;
-    if bytes_read == 0 {
-        info!("connection closed before authenticating");
-        return Ok(());
-    }
-
-    let authenticated = matches!(
-        serde_json::from_str::<SyncMessage>(auth_line.trim()),
-        Ok(SyncMessage::Auth { token }) if token == *expected_token
-    );
-
-    if !authenticated {
-        warn!("authentication failed, closing connection");
-        return Ok(());
-    }
-
-    info!("authenticated");
-
+/// The post-authentication part of a sync session: send the manifest, then
+/// process messages until the client disconnects. Split out of
+/// handle_connection so the caller can time it and log one summary record
+/// regardless of how it ends (success, protocol error, or network error).
+async fn run_sync_loop(reader: &mut ConnReader, write_half: &mut ConnWriter, stats: &mut SessionStats) -> Result<()> {
     let manifest = build_manifest("received_files");
     let manifest_message = SyncMessage::Manifest(manifest);
     let json = serde_json::to_string(&manifest_message)?;
@@ -179,6 +191,7 @@ async fn handle_connection(socket: TcpStream, expected_token: Arc<String>) -> Re
                         match message {
                             SyncMessage::Auth { .. } => {
                                 warn!("duplicate auth message, ignoring");
+                                stats.errors += 1;
                             }
                             SyncMessage::FileInfo(file_info) => {
                                 debug!(?file_info, "received file info");
@@ -190,61 +203,154 @@ async fn handle_connection(socket: TcpStream, expected_token: Arc<String>) -> Re
                             SyncMessage::FileContentStream { path } => {
                                 let expected_hash = pending_file.take().and_then(|info| info.hash);
                                 let file_span = tracing::info_span!("file_transfer", path = %path);
-                                handle_file_stream(&mut reader, &path, expected_hash)
-                                    .instrument(file_span)
-                                    .await?;
+                                match handle_file_stream(reader, &path, expected_hash).instrument(file_span).await? {
+                                    FileOutcome::Saved { bytes } => {
+                                        stats.files_saved += 1;
+                                        stats.bytes_written += bytes;
+                                    }
+                                    FileOutcome::Rejected => {
+                                        stats.errors += 1;
+                                    }
+                                }
                             }
                             SyncMessage::DeleteFile { path } => {
                                 match build_safe_path("received_files", &path) {
                                     Ok(safe_path) => {
                                         match std::fs::remove_file(&safe_path) {
-                                            Ok(_) => info!(path = %safe_path.display(), "deleted file"),
-                                            Err(e) => error!(path = %safe_path.display(), error = %e, "could not delete file"),
+                                            Ok(_) => {
+                                                info!(path = %safe_path.display(), "deleted file");
+                                                stats.files_deleted += 1;
+                                            }
+                                            Err(e) => {
+                                                error!(path = %safe_path.display(), error = %e, "could not delete file");
+                                                stats.errors += 1;
+                                            }
                                         }
                                     }
-                                    Err(e) => warn!(error = %e, "rejected delete (possible path traversal)"),
+                                    Err(e) => {
+                                        warn!(error = %e, "rejected delete (possible path traversal)");
+                                        stats.errors += 1;
+                                    }
                                 }
                             }
                             SyncMessage::CreateDir { path } => {
                                 match build_safe_path("received_files", &path) {
                                     Ok(safe_path) => {
                                         match std::fs::create_dir_all(&safe_path) {
-                                            Ok(_) => info!(path = %safe_path.display(), "created directory"),
-                                            Err(e) => error!(path = %safe_path.display(), error = %e, "could not create directory"),
+                                            Ok(_) => {
+                                                info!(path = %safe_path.display(), "created directory");
+                                                stats.dirs_created += 1;
+                                            }
+                                            Err(e) => {
+                                                error!(path = %safe_path.display(), error = %e, "could not create directory");
+                                                stats.errors += 1;
+                                            }
                                         }
                                     }
-                                    Err(e) => warn!(error = %e, "rejected create-dir (possible path traversal)"),
+                                    Err(e) => {
+                                        warn!(error = %e, "rejected create-dir (possible path traversal)");
+                                        stats.errors += 1;
+                                    }
                                 }
                             }
                             SyncMessage::RemoveDir { path } => {
                                 match build_safe_path("received_files", &path) {
                                     Ok(safe_path) => {
                                         match std::fs::remove_dir_all(&safe_path) {
-                                            Ok(_) => info!(path = %safe_path.display(), "removed directory"),
-                                            Err(e) => error!(path = %safe_path.display(), error = %e, "could not remove directory"),
+                                            Ok(_) => {
+                                                info!(path = %safe_path.display(), "removed directory");
+                                                stats.dirs_removed += 1;
+                                            }
+                                            Err(e) => {
+                                                error!(path = %safe_path.display(), error = %e, "could not remove directory");
+                                                stats.errors += 1;
+                                            }
                                         }
                                     }
-                                    Err(e) => warn!(error = %e, "rejected remove-dir (possible path traversal)"),
+                                    Err(e) => {
+                                        warn!(error = %e, "rejected remove-dir (possible path traversal)");
+                                        stats.errors += 1;
+                                    }
                                 }
                             }
                             SyncMessage::Manifest(_) => {
                                 warn!("unexpected manifest message from client");
+                                stats.errors += 1;
                             }
                         }
                     }
                     Err(err) => {
                         warn!(error = %err, raw_line = %line.trim(), "failed to parse JSON");
+                        stats.errors += 1;
                     }
                 }
             }
             Err(err) => {
                 error!(error = %err, "network error while reading");
+                stats.errors += 1;
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+async fn handle_connection(socket: TcpStream, expected_token: Arc<String>) -> Result<()> {
+    let (read_half, mut write_half) = socket.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // First message on the wire must be Auth with a matching token.
+    let mut auth_line = String::new();
+    let bytes_read = reader.read_line(&mut auth_line).await?;
+    if bytes_read == 0 {
+        info!("connection closed before authenticating");
+        return Ok(());
+    }
+
+    let authenticated = matches!(
+        serde_json::from_str::<SyncMessage>(auth_line.trim()),
+        Ok(SyncMessage::Auth { token }) if token == *expected_token
+    );
+
+    if !authenticated {
+        warn!("authentication failed, closing connection");
+        return Ok(());
+    }
+
+    info!("authenticated");
+
+    let start = Instant::now();
+    let mut stats = SessionStats::default();
+
+    let result = run_sync_loop(&mut reader, &mut write_half, &mut stats).await;
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    if stats.errors > 0 || result.is_err() {
+        warn!(
+            files_saved = stats.files_saved,
+            bytes_written = stats.bytes_written,
+            files_deleted = stats.files_deleted,
+            dirs_created = stats.dirs_created,
+            dirs_removed = stats.dirs_removed,
+            errors = stats.errors,
+            elapsed_ms,
+            "session summary"
+        );
+    } else {
+        info!(
+            files_saved = stats.files_saved,
+            bytes_written = stats.bytes_written,
+            files_deleted = stats.files_deleted,
+            dirs_created = stats.dirs_created,
+            dirs_removed = stats.dirs_removed,
+            elapsed_ms,
+            "session summary"
+        );
+    }
+
+    result
 }
 
 pub async fn run_server() -> Result<()> {
